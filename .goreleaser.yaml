@@ -38,14 +38,26 @@ archives:
       {{- if .Arm }}v{{ .Arm }}{{ end }}
 
 nfpms:
-  - id: packages
+  - id: versioned
     package_name: raspbian-ca-update
-    file_name_template: "{{ .ConventionalFileName }}"
+    file_name_template: "{{ .PackageName }}_{{ .Version }}_{{ .Arch }}"
     vendor: bellx2
     homepage: https://github.com/bellx2/raspbian-ca-update
     maintainer: bellx2
     description: |-
       Raspbian CA certificate update utility
+    license: MIT
+    formats:
+      - deb
+    bindir: /usr/local/bin
+  - id: latest
+    package_name: raspbian-ca-update
+    file_name_template: "{{ .PackageName }}_latest_{{ .Arch }}"
+    vendor: bellx2
+    homepage: https://github.com/bellx2/raspbian-ca-update
+    maintainer: bellx2
+    description: |-
+      Raspbian CA certificate update utility (latest version)
     license: MIT
     formats:
       - deb
