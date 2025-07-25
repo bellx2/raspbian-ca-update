@@ -7,19 +7,22 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 const (
-	version    = "1.0.0"
+	version    = "1.1.0"
 	caURL      = "https://curl.se/ca/cacert.pem"
 	caPath     = "/etc/ssl/certs/ca-certificates.crt"
 	backupPath = "/etc/ssl/certs/ca-certificates.crt.backup"
@@ -27,6 +30,33 @@ const (
 )
 
 func main() {
+	// Define flags
+	var (
+		showVersion  = flag.Bool("version", false, "Show version information")
+		checkMode    = flag.Bool("check", false, "Check current CA certificates status")
+		forceMode    = flag.Bool("force", false, "Force execution on non-Raspbian systems")
+		insecureMode = flag.Bool("insecure", false, "Skip SSL certificate verification when downloading")
+	)
+	
+	// Add short versions
+	flag.BoolVar(showVersion, "v", false, "Show version information")
+	
+	flag.Parse()
+
+	// Handle version flag
+	if *showVersion {
+		fmt.Printf("raspbian-ca-update v%s\n", version)
+		fmt.Println("Copyright (c) 2025 Ryu Tanabe (bellx2)")
+		fmt.Println("https://github.com/bellx2")
+		return
+	}
+
+	// Handle check flag
+	if *checkMode {
+		checkCertificates()
+		return
+	}
+
 	fmt.Printf("Raspbian CA Update Tool v%s\n", version)
 	fmt.Println("===========================")
 
@@ -36,32 +66,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	forceMode := false
-	insecureMode := false
-	
-	// Parse command line arguments
-	for i := 1; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "--help", "-h":
-			showHelp()
-			return
-		case "--version", "-v":
-			fmt.Printf("raspbian-ca-update v%s\n", version)
-			fmt.Println("Copyright (c) 2025 Ryu Tanabe (bellx2)")
-			fmt.Println("https://github.com/bellx2")
-			return
-		case "--check":
-			checkCertificates()
-			return
-		case "--force":
-			forceMode = true
-		case "--insecure":
-			insecureMode = true
-		}
-	}
-
 	// Check if system is Raspbian
-	if !forceMode && !isRaspbian() {
+	if !*forceMode && !isRaspbian() {
 		fmt.Println("Error: This system is not Raspbian")
 		fmt.Println("This tool is designed specifically for Raspbian systems.")
 		fmt.Println("Use --force to run anyway (not recommended)")
@@ -69,7 +75,7 @@ func main() {
 	}
 
 	// Check CA certificate path
-	if !forceMode && !isCAPathValid() {
+	if !*forceMode && !isCAPathValid() {
 		fmt.Println("Error: CA certificate path is not standard")
 		fmt.Printf("Expected path: %s\n", caPath)
 		fmt.Println("This system may use a different certificate location.")
@@ -78,12 +84,12 @@ func main() {
 	}
 
 	// Show warning if using insecure mode
-	if insecureMode {
+	if *insecureMode {
 		fmt.Println("Warning: Running in insecure mode - SSL certificate verification disabled")
 	}
 
 	// Main update process
-	if err := updateCACertificates(insecureMode); err != nil {
+	if err := updateCACertificates(*insecureMode); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -96,30 +102,6 @@ func main() {
 	} else {
 		fmt.Println("SSL connection test passed!")
 	}
-}
-
-func showHelp() {
-	fmt.Println(`Usage: raspbian-ca-update [options]
-
-Options:
-  --help, -h     Show this help message
-  --version, -v  Show version information
-  --check        Check current CA certificates status
-  --force        Force execution even on non-Raspbian systems
-  --insecure     Skip SSL certificate verification when downloading
-
-Description:
-  Updates CA certificates on old Raspbian systems where package
-  management cannot update ca-certificates due to OpenSSL version
-  dependencies.
-
-Examples:
-  sudo raspbian-ca-update                # Update CA certificates
-  raspbian-ca-update --check             # Check current status
-  sudo raspbian-ca-update --force        # Force update on any system
-  sudo raspbian-ca-update --insecure     # Download without SSL verification
-  sudo raspbian-ca-update --force --insecure # Combine options
-`)
 }
 
 func checkCertificates() {
@@ -203,19 +185,18 @@ func createBackup() error {
 
 	source, err := os.Open(caPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open source file: %w", err)
 	}
 	defer source.Close()
 
 	destination, err := os.Create(backupPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create backup file: %w", err)
 	}
 	defer destination.Close()
 
-	_, err = io.Copy(destination, source)
-	if err != nil {
-		return err
+	if _, err := io.Copy(destination, source); err != nil {
+		return fmt.Errorf("failed to copy file: %w", err)
 	}
 
 	fmt.Printf("Backup created: %s\n", backupPath)
@@ -225,22 +206,19 @@ func createBackup() error {
 func downloadCACertificates(insecure bool) error {
 	fmt.Printf("Downloading CA certificates from %s...\n", caURL)
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-	
-	// Skip certificate verification if insecure mode is enabled
-	if insecure {
-		client.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client := createHTTPClient(insecure)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, caURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := client.Get(caURL)
+	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to download certificates: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -250,17 +228,32 @@ func downloadCACertificates(insecure bool) error {
 
 	file, err := os.Create(caPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create certificate file: %w", err)
 	}
 	defer file.Close()
 
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
-		return err
+	if _, err := io.Copy(file, resp.Body); err != nil {
+		return fmt.Errorf("failed to write certificate file: %w", err)
 	}
 
 	fmt.Println("CA certificates downloaded successfully")
 	return nil
+}
+
+func createHTTPClient(insecure bool) *http.Client {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+	
+	if insecure {
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+	}
+	
+	return client
 }
 
 func rehashCertificates() error {
@@ -288,7 +281,10 @@ func createHashLinksManually() error {
 	}
 
 	for _, match := range matches {
-		os.Remove(match)
+		if err := os.Remove(match); err != nil {
+			// Log but continue - old links may not exist
+			fmt.Printf("Warning: failed to remove old link %s: %v\n", match, err)
+		}
 	}
 
 	// Create hash links from certificate files
@@ -307,7 +303,7 @@ func createHashLinksManually() error {
 			continue
 		}
 
-		hash := string(output[:8]) // First 8 characters
+		hash := strings.TrimSpace(string(output))
 		linkName := filepath.Join(certsDir, hash+".0")
 		
 		// Create symbolic link with relative path
@@ -316,7 +312,9 @@ func createHashLinksManually() error {
 			relPath = certFile
 		}
 
-		os.Remove(linkName) // Remove existing link
+		if err := os.Remove(linkName); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Warning: failed to remove existing link %s: %v\n", linkName, err)
+		}
 		if err := os.Symlink(relPath, linkName); err != nil {
 			fmt.Printf("Warning: failed to create link %s -> %s: %v\n", linkName, relPath, err)
 		}
@@ -327,13 +325,21 @@ func createHashLinksManually() error {
 }
 
 func testSSLConnection() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
 
-	resp, err := client.Get("https://www.google.com")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.google.com", nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create test request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("SSL connection test failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -343,16 +349,12 @@ func testSSLConnection() error {
 func parsePEMCertificates(data []byte) ([]*x509.Certificate, error) {
 	var certs []*x509.Certificate
 	
-	// Simple certificate count (number of BEGIN CERTIFICATE)
-	count := 0
-	for i := 0; i < len(data)-len("-----BEGIN CERTIFICATE-----"); i++ {
-		if string(data[i:i+len("-----BEGIN CERTIFICATE-----")]) == "-----BEGIN CERTIFICATE-----" {
-			count++
-		}
-	}
+	// Simple certificate count using strings package
+	content := string(data)
+	count := strings.Count(content, "-----BEGIN CERTIFICATE-----")
 	
 	// Return dummy certificate slice
-	for i := 0; i < count; i++ {
+	for range count {
 		certs = append(certs, &x509.Certificate{})
 	}
 	
@@ -368,10 +370,10 @@ func isRaspbian() bool {
 
 	content := string(data)
 	// Identify Raspbian or Raspberry Pi OS
-	return contains(content, "ID=raspbian") || 
-		contains(content, "ID_LIKE=raspbian") ||
-		contains(content, "PRETTY_NAME=\"Raspbian") ||
-		contains(content, "PRETTY_NAME=\"Raspberry Pi OS")
+	return strings.Contains(content, "ID=raspbian") || 
+		strings.Contains(content, "ID_LIKE=raspbian") ||
+		strings.Contains(content, "PRETTY_NAME=\"Raspbian") ||
+		strings.Contains(content, "PRETTY_NAME=\"Raspberry Pi OS")
 }
 
 func isCAPathValid() bool {
@@ -383,22 +385,4 @@ func isCAPathValid() bool {
 
 	// Ensure it's a file, not a directory
 	return !info.IsDir()
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && 
-		(s == substr || 
-		 len(s) > len(substr) && 
-		 (s[:len(substr)] == substr || 
-		  s[len(s)-len(substr):] == substr || 
-		  containsInMiddle(s, substr)))
-}
-
-func containsInMiddle(s, substr string) bool {
-	for i := 1; i < len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
