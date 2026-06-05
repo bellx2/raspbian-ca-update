@@ -26,7 +26,12 @@ const (
 	caURL      = "https://curl.se/ca/cacert.pem"
 	caPath     = "/etc/ssl/certs/ca-certificates.crt"
 	backupPath = "/etc/ssl/certs/ca-certificates.crt.backup"
+	tempPath   = "/etc/ssl/certs/ca-certificates.crt.tmp"
 	certsDir   = "/etc/ssl/certs"
+
+	minBundleSize = 100 * 1024
+	maxBundleSize = 2 * 1024 * 1024
+	pemBeginMarker = "-----BEGIN CERTIFICATE-----"
 )
 
 func main() {
@@ -163,6 +168,7 @@ func updateCACertificates(insecure bool) error {
 
 	// 3. Set permissions
 	if err := os.Chmod(caPath, 0644); err != nil {
+		rollbackOnFailure("chmod failure")
 		return fmt.Errorf("chmod failed: %w", err)
 	}
 
@@ -226,18 +232,92 @@ func downloadCACertificates(insecure bool) error {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
 	}
 
-	file, err := os.Create(caPath)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBundleSize+1))
 	if err != nil {
-		return fmt.Errorf("failed to create certificate file: %w", err)
+		return fmt.Errorf("failed to read response: %w", err)
 	}
-	defer file.Close()
+	if len(data) > maxBundleSize {
+		return fmt.Errorf("download exceeds maximum size of %d bytes", maxBundleSize)
+	}
+	if err := validatePEMBundle(data); err != nil {
+		return fmt.Errorf("invalid certificate bundle: %w", err)
+	}
 
-	if _, err := io.Copy(file, resp.Body); err != nil {
-		return fmt.Errorf("failed to write certificate file: %w", err)
+	if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove stale temp file: %w", err)
+	}
+
+	file, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create temp certificate file: %w", err)
+	}
+
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to write temp certificate file: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to sync temp certificate file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to close temp certificate file: %w", err)
+	}
+
+	if err := os.Rename(tempPath, caPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to install certificate file: %w", err)
 	}
 
 	fmt.Println("CA certificates downloaded successfully")
 	return nil
+}
+
+func validatePEMBundle(data []byte) error {
+	size := len(data)
+	if size < minBundleSize {
+		return fmt.Errorf("bundle too small: %d bytes (minimum %d)", size, minBundleSize)
+	}
+	if !strings.Contains(string(data), pemBeginMarker) {
+		return fmt.Errorf("bundle does not contain PEM certificates")
+	}
+	return nil
+}
+
+func restoreBackup() error {
+	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+		return fmt.Errorf("no backup file available at %s", backupPath)
+	}
+
+	source, err := os.Open(backupPath)
+	if err != nil {
+		return fmt.Errorf("failed to open backup file: %w", err)
+	}
+	defer source.Close()
+
+	destination, err := os.Create(caPath)
+	if err != nil {
+		return fmt.Errorf("failed to open CA certificate file: %w", err)
+	}
+	defer destination.Close()
+
+	if _, err := io.Copy(destination, source); err != nil {
+		return fmt.Errorf("failed to restore backup: %w", err)
+	}
+
+	fmt.Printf("Restored CA certificates from backup: %s\n", backupPath)
+	return nil
+}
+
+func rollbackOnFailure(reason string) {
+	fmt.Printf("Attempting rollback due to %s...\n", reason)
+	if err := restoreBackup(); err != nil {
+		fmt.Printf("Warning: rollback failed: %v\n", err)
+		fmt.Printf("Manual recovery: sudo cp %s %s\n", backupPath, caPath)
+	}
 }
 
 func createHTTPClient(insecure bool) *http.Client {

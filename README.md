@@ -2,7 +2,7 @@
 
 A tool for updating CA certificates on old Raspbian systems
 
-Version: 1.0.0
+Version: 1.1.0
 
 ## Overview
 
@@ -12,6 +12,9 @@ On older Raspbian systems, CA certificates may not be updatable through the stan
 
 - Automatically downloads the latest CA certificates from curl.se
 - Creates automatic backup of existing certificates
+- Validates downloaded PEM bundle before installation
+- Installs certificates atomically via a temporary file
+- Automatically rolls back from backup on post-install failures
 - Rebuilds certificate hash links
 - SSL connection test functionality
 - Checks current certificate status
@@ -67,9 +70,17 @@ sudo raspbian-ca-update --force --insecure
 
 1. Creates backup of existing CA certificates (`/etc/ssl/certs/ca-certificates.crt.backup`)
 2. Downloads latest CA certificates from curl.se
-3. Sets file permissions (644)
-4. Rebuilds certificate hash links
-5. Runs SSL connection test
+3. Validates the downloaded bundle (PEM markers and size limits)
+4. Writes to a temporary file (`/etc/ssl/certs/ca-certificates.crt.tmp`) and atomically replaces the live bundle
+5. Sets file permissions (644)
+6. Rebuilds certificate hash links
+7. Runs SSL connection test
+
+If a failure occurs after the bundle has been replaced (for example, during permission changes), the tool automatically restores the backup. If automatic rollback fails, restore manually:
+
+```bash
+sudo cp /etc/ssl/certs/ca-certificates.crt.backup /etc/ssl/certs/ca-certificates.crt
+```
 
 ## Requirements
 
